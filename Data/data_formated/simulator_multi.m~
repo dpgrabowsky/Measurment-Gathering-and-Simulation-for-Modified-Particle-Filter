@@ -1,0 +1,320 @@
+clear
+clc
+%This file is used to simulate the particle filter using the gathered data.
+addpath('/home/turtlebotmaster/Desktop/particle_filter')
+
+
+trail_list={'1','2','3','4','5','6','7','8','9','10'};
+
+for(zz=1:length(trail_list))
+    clearvars -except trail_list zz
+    %% Load and format data
+    % Load the data
+
+    temp=strcat('ftrail_',trail_list{zz});
+    trail=strcat(temp,'.mat');
+    file_path=strcat('/home/turtlebotmaster/Desktop/turtlebot_pozyx_measurment_gather/Data/data_formated/',trail);
+    load(file_path)
+    
+    
+    
+    % General algorithm: First, use the odom_command to update the position ofinitPose
+    % the simulated turtlebot. Then check if odom timestamp has elapsed past
+    % any range_measurment time_stamps. If so then place that range measurment
+    % into temporary storage. Once enough range measurments have been gathered
+    % to trilaterate then do so, unless the difference in time between range
+    % measurments is greater than some amount of time.
+    
+    
+    % Define vars
+    numParticles=1000;
+    aID={'0x6940','0x6935','0x6955'};
+    colors={[.75 .75 0],[1 0 0],[.3 .3 .9]};
+    %Create and init pf filter for robot
+    fprintf('Initalizing robot particle filter... \n');
+    initPose=[6.044,3.66,pi];
+    robotFilter=pf(numParticles,3);
+    robotFilter.initRobot(initPose,.5)
+    fprintf('Robot particle filter initalized\n\n');
+    
+    range_measurment_blacklist=cell(1,length(pozyx_anchor_names));
+    most_recent_ranges=[0 0 0];
+    most_recent_RP=initPose(1:2);
+    path_error_pf=[];
+    path_history=[];
+    F_pf=[];
+    lm_error=[];
+    fprintf('Starting...')
+    
+    
+    
+    for(ii=2:length(turtlebot_odom_command)-1)
+        %% Use odom_command to move the robot
+        robotFilter.MotionModel(turtlebot_odom_command(:,ii),turtlebot_odom_command_timestamps(ii)-turtlebot_odom_command_timestamps(ii-1));
+        
+        %% Check for range measurements
+        %Get list of all range measurments before current odom timestamp
+        temp=cell(1,length(pozyx_anchor_names));
+        current_time=turtlebot_odom_command_timestamps(ii);
+        for(jj=1:length(pozyx_anchor_names))
+            temp{jj}=pozyx_range_measurments_time_stamps{jj}<current_time;
+            %convert to idxs
+            temp{jj}=find(temp{jj});
+            %temp{jj}=pozyx_range_measurments{jj}(temp{jj});
+            
+        end
+        
+        %Check that there has been at least one measurment from each sensor
+        ranges=zeros(1,length(pozyx_anchor_names));
+        if(all(~cellfun(@isempty,temp)))
+            %delete all but the most recent measurments from temp
+            for(jj=1:length(pozyx_anchor_names))
+                temp{jj}=temp{jj}(end);
+                timestamp(jj)=pozyx_range_measurments_time_stamps{jj}(temp{jj});
+                %ranges(jj)=pozyx_range_measurments{jj}(temp{jj});
+            end
+            
+            %check that the max time difference is less than .5
+            if((max(timestamp)-min(timestamp))<.5)
+                %black list all earlier timestamps
+                for(jj=1:length(pozyx_anchor_names))
+                    %If measurment is already blacklisted just set it to 0,
+                    %will be noticed in later ifstatement
+                    if(ismember(temp{jj},range_measurment_blacklist{jj})|| pozyx_range_measurments{jj}(temp{jj})<.50)
+                        ranges(jj)=0;
+                    else
+                        ranges(jj)=pozyx_range_measurments{jj}(temp{jj});
+                    end
+                    % range_measurment_blacklist{jj}=[range_measurment_blacklist{jj} temp{jj}];
+                    
+                end
+            end
+            
+        end
+        
+        %If any ranges were black listed toggle the ranges_aval flag.
+        ranges_aval=1;
+        if(sum(ranges==0)>0)
+            ranges_aval=0;
+        end
+        
+        %% If ranges are aviable and ladnmark particles havent converged (not implemented) then init/update landmark particles
+        if(~exist('landmarkFilters') && ranges_aval)
+            fprintf('Initalizing landmark particle filtes...\n');
+            for(jj=1:length(pozyx_anchor_names))
+                landmarkFilters{jj}=pf(numParticles,2);
+                initPose=[mean(robotFilter.particles(:,1)) mean(robotFilter.particles(:,2))];
+                %initPose=pozyx_anchor_coords(jj,:)+normrnd(0,.5,[1,2]);
+                %landmarkFilters{jj}.initLandmark(initPose(1:2),ranges(jj),.5,'donut');
+                landmarkFilters{jj}.initLandmark(pozyx_anchor_coords(jj,:),1,.05,'circle');
+            end
+        elseif(ranges_aval)
+            for(jj=1:length(pozyx_anchor_names))
+                % As long as landmarks have not converged and at least 10 seconds havent passed keep updating
+                VARCONST=.25;
+                if(((var(landmarkFilters{jj}.particles(:,1))>VARCONST)||( var(landmarkFilters{jj}.particles(:,2))>VARCONST))|| (turtlebot_odom_command_timestamps(ii)<20))
+                    robotPose=[mean(robotFilter.particles(:,1)) mean(robotFilter.particles(:,2))];
+                    landmarkFilters{jj}.MeasurmentModelLM(ranges(jj),robotPose(1:2));
+                end
+            end
+            range_measurment_blacklist{jj}=[range_measurment_blacklist{jj} temp{jj}];
+        end
+        
+        
+        
+        
+        %% If any landmarks are converged and a measurment was recevied use it
+        %% to update the robot particles
+        lm=[];
+        idx_temp=[];
+        if(exist('landmarkFilters') && ranges_aval)
+            for(jj=1:length(pozyx_anchor_names))
+                VARCONST=.50;
+                if((var(landmarkFilters{jj}.particles(:,1))<VARCONST) &&( var(landmarkFilters{jj}.particles(:,2))<VARCONST)&& (turtlebot_odom_command_timestamps(ii)>1))
+                    lm(jj,:)=[mean(landmarkFilters{jj}.particles(:,1)),mean(landmarkFilters{jj}.particles(:,2))];
+                    idx_temp=[idx_temp;jj];
+                else
+                    lm(jj,:)=0;
+                end
+            end
+            if(sum(lm)>0)
+                robotFilter.MeasurmentModelRbot(ranges(idx_temp),lm(idx_temp,:));
+            end
+        end
+        
+        
+        
+        %% Optional Plot
+        figure(1)
+        clf
+        %plot robot
+        scatter(robotFilter.particles(:,1),robotFilter.particles(:,2))
+        hold on
+        rP=[mean(robotFilter.particles(:,1)) mean(robotFilter.particles(:,2))];
+        plot(rP(1),rP(2),'mX');
+        path_history=[path_history;rP];
+        plot(path_history(:,1),path_history(:,2),'m--')
+        %plot landmarks
+        lm_temp=[];
+        if(exist('landmarkFilters'))
+            for(jj=1:length(pozyx_anchor_names))
+                scatter(landmarkFilters{jj}.particles(:,1),landmarkFilters{jj}.particles(:,2),20,[colors{jj}]);
+                lm=[mean(landmarkFilters{jj}.particles(:,1)),mean(landmarkFilters{jj}.particles(:,2))];
+                lm_temp(jj)=pdist([lm;pozyx_anchor_coords(jj,:)],'euclidean');
+                scatter(lm(1),lm(2),100,'kX')
+                
+                slightlyDiffColors=colors{jj};
+                slightlyDiffColors(2)=.5;
+                scatter(pozyx_anchor_coords(jj,1),pozyx_anchor_coords(jj,2),100,slightlyDiffColors,'filled')
+                
+                
+                if(sum(ranges==0)==0)
+                    most_recent_ranges=ranges;
+                    most_recent_RP=rP;
+                end
+                if(ii==length(turtlebot_odom_command)-1)
+                    labelpoints(pozyx_anchor_coords(jj,1),pozyx_anchor_coords(jj,2),pozyx_anchor_names{jj},'N',0.2,1)
+                    labelpoints(rP(1),rP(2),'robot','S',0.2,1)
+                else
+                    % Plot ranges
+                    th = 0:pi/50:2*pi;
+                    r=most_recent_ranges(jj);
+                    x=most_recent_RP(1);
+                    y=most_recent_RP(2);
+                    xunit = r * cos(th) + x;
+                    yunit = r * sin(th) + y;
+                    plot(xunit, yunit,'color',slightlyDiffColors);
+                end
+            end
+        end
+        % Create general plot (including just landmarks and known robot path).
+        knownPath=[6.044 3.66;...
+            5.13 3.66;...
+            4.22 3.66;...
+            3.31 3.66;...
+            3.31 3.96;...
+            2.39 3.96;...
+            1.48 3.96;...
+            0.56 3.96;...
+            0.56 3.35;...
+            1.48 3.35;...
+            2.69 3.35;...
+            2.69 2.43;...
+            2.69 1.52;...
+            2.69 0.9116;
+            ];
+        pathLabels={'start';'1';'2';'3';'4';'5';'6';'7';'8';'9';'10';'11';'12';'13'};
+        plot(knownPath(:,1),knownPath(:,2),'k-o')
+        labelpoints(knownPath(:,1),knownPath(:,2),pathLabels,'SE',0.2,1)
+        xlabel('meters')
+        ylabel('meters')
+        
+        hold off
+        
+        
+        axis([-1 7.5 -2.5 5.5]);
+        pause(.001)
+        %F_pf(ii-1) = getframe(gcf) ;
+        drawnow
+        
+        if(ii==length(turtlebot_odom_command)-1)
+            tempname = erase(trail,'.mat');
+            tempname=strcat('frames_pf_',tempname);
+            tempname = strcat('final_withpar_',strcat(tempname,'.png'));
+            file_path=strcat('/home/turtlebotmaster/Desktop/turtlebot_pozyx_measurment_gather/Data/data_formated/',tempname);
+            saveas(gcf,file_path)
+        end
+        
+        
+        path_error_pf=[path_error_pf;calcDistance(knownPath,rP)];
+        lm_error=[lm_error;lm_temp];
+    end
+    
+    figure(2)
+    clf
+    rP=[mean(robotFilter.particles(:,1)) mean(robotFilter.particles(:,2))];
+    hold on
+    scatter(rP(1),rP(2),200,'mX');
+    path_history=[path_history;rP];
+    plot(path_history(:,1),path_history(:,2),'m--')
+    
+    if(exist('landmarkFilters'))
+        for(jj=1:length(pozyx_anchor_names))
+            lm=[mean(landmarkFilters{jj}.particles(:,1)),mean(landmarkFilters{jj}.particles(:,2))];
+            %scatter(lm(1),lm(2),200,'X','MarkerFaceColor',colors{jj})
+            scatter(lm(1),lm(2),200,colors{jj},'X')
+            scatter(pozyx_anchor_coords(jj,1),pozyx_anchor_coords(jj,2),100,colors{jj},'filled')
+            labelpoints(pozyx_anchor_coords(jj,1),pozyx_anchor_coords(jj,2),pozyx_anchor_names{jj},'N',0.2,1)
+        end
+    end
+    
+    knownPath=[6.044 3.66;...
+        5.13 3.66;...
+        4.22 3.66;...
+        3.31 3.66;...
+        3.31 3.96;...
+        2.39 3.96;...
+        1.48 3.96;...
+        0.56 3.96;...
+        0.56 3.35;...
+        1.48 3.35;...
+        2.69 3.35;...
+        2.69 2.43;...
+        2.69 1.52;...
+        2.69 0.9116;
+        ];
+    pathLabels={'start';'1';'2';'3';'4';'5';'6';'7';'8';'9';'10';'11';'12';'13'};
+    plot(knownPath(:,1),knownPath(:,2),'k-o')
+    labelpoints(knownPath(:,1),knownPath(:,2),pathLabels,'SE',0.2,1)
+    labelpoints(rP(1),rP(2),'robot','S',0.2,1)
+    hold off
+    axis([-1 7.5 -2.5 5.5]);
+    xlabel('meters')
+    ylabel('meters')
+    
+    
+    %% Save frames for vidoe
+    
+    trail=strcat('frames_pf_',trail);
+    file_path=strcat('/home/turtlebotmaster/Desktop/turtlebot_pozyx_measurment_gather/Data/data_formated/',trail);
+    save(file_path,'F_pf','path_error_pf','lm_error')
+    
+    
+    trail = erase(trail,'.mat');
+    trail = strcat('final_nopar_',strcat(trail,'.png'));
+    file_path=strcat('/home/turtlebotmaster/Desktop/turtlebot_pozyx_measurment_gather/Data/data_formated/',trail);
+    saveas(gcf,file_path)
+    
+    
+    
+    
+    
+end
+
+
+
+
+
+
+
+
+
+
+
+function dist=calcDistance(path,point)
+    for(ii=1:length(path)-1)
+        y2=path(ii+1,2);
+        y1=path(ii,2);
+        x2=path(ii+1,1);
+        x1=path(ii,1);
+        x0=point(1);
+        y0=point(2);
+        
+        num=abs((y2-y1)*x0-(x2-x1)*y0+x2*y1-y2*x1);
+        denom=sqrt((y2-y1)^2+(x2-x1)^2);
+        dist(ii)=num/denom;
+    end
+    dist=min(dist);
+end
+
+
